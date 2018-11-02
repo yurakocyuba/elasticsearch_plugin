@@ -2,13 +2,11 @@
 #include "exceptions.hpp"
 
 #include <fc/variant.hpp>
-#include <boost/thread/mutex.hpp>
 
 namespace eosio
 {
 
 void deserializer::purge_abi_cache() {
-   std::lock_guard<std::mutex> gurad(cache_mtx);
    if( abi_cache_index.size() < abi_cache_size ) return;
 
    // remove the oldest (smallest) last accessed
@@ -49,6 +47,7 @@ optional<abi_serializer> deserializer::find_abi_cache(const account_name &name) 
 
 void deserializer::insert_abi_cache( const abi_cache &entry ) {
    std::lock_guard<std::mutex> gurad(cache_mtx);
+   purge_abi_cache();
    abi_cache_index.insert( entry );
 }
 
@@ -77,7 +76,7 @@ optional<abi_serializer> deserializer::get_abi_serializer( const account_name &n
                return optional<abi_serializer>();
             }
 
-            purge_abi_cache(); // make room if necessary
+            // purge_abi_cache(); // make room if necessary
             abi_cache entry;
             entry.account = name;
             entry.last_accessed = fc::time_point::now();

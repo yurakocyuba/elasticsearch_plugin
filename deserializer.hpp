@@ -1,8 +1,6 @@
 #pragma once
 #include <appbase/application.hpp>
 #include <eosio/chain_plugin/chain_plugin.hpp>
-#include <boost/thread/mutex.hpp>
-
 #include "elastic_client.hpp"
 
 namespace eosio {
@@ -27,18 +25,18 @@ public:
 
    void erase_abi_cache(const account_name &name);
 
-private:
-   struct by_account;
-   struct by_last_access;
-
    struct abi_cache {
       account_name                     account;
       fc::time_point                   last_accessed;
       fc::optional<abi_serializer>     serializer;
    };
-
-   void purge_abi_cache();
    void insert_abi_cache( const abi_cache &entry );
+   void purge_abi_cache();
+private:
+   struct by_account;
+   struct by_last_access;
+
+
    optional<abi_serializer> find_abi_cache(const account_name &name);
    optional<fc::variant> get_abi_by_account(const account_name &name);
    optional<abi_serializer> get_abi_serializer( const account_name &name );

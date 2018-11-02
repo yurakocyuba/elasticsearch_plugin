@@ -385,7 +385,9 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
 void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
    try {
       // always call since we need to capture setabi on accounts even if not storing transaction traces
-      _process_applied_transaction( std::move(t) );
+      if( start_block_reached ) {
+         _process_applied_transaction( std::move(t) );
+      }
    } catch (fc::exception& e) {
       elog("FC Exception while processing applied transaction trace: ${e}", ("e", e.to_detail_string()));
    } catch (std::exception& e) {
@@ -504,6 +506,14 @@ void elasticsearch_plugin_impl::upsert_account_setabi(
    fc::mutable_variant_object& param_doc, const chain::setabi& setabi, std::chrono::milliseconds& now )
 {
    abi_def abi_def = fc::raw::unpack<chain::abi_def>( setabi.abi );
+
+   deserializer::abi_cache entry;
+   entry.account = setabi.account;
+   entry.last_accessed = fc::time_point::now();
+   abi_serializer abis;
+   abis.set_abi( abi_def, abi_serializer_max_time );
+   entry.serializer.emplace( std::move( abis ) );
+   abi_deserializer->insert_abi_cache( entry );
 
    param_doc("name", setabi.account.to_string());
    param_doc("abi", abi_def);

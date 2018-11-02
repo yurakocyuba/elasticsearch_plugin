@@ -78,6 +78,14 @@ bulker& bulker_pool::get() {
    } else {
       return *ptr;
    }
+
+   // size_t cur_idx = index;
+
+   // cur_idx = (cur_idx + 1) % pool_size;
+   // auto ptr = bulker_vec[cur_idx].get();
+   // index = cur_idx;
+
+   // return *ptr;
 }
 
 }
