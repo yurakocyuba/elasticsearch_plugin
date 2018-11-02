@@ -126,7 +126,7 @@ public:
    bool store_action_traces = true;
 
    std::unique_ptr<elastic_client> es_client;
-   std::unique_ptr<deserializer> abi_deserializer;
+   std::unique_ptr<deserializer_pool> abi_pool;
    std::unique_ptr<bulker_pool> bulk_pool;
    std::unique_ptr<ThreadPool> thread_pool;
    size_t max_task_queue_size = 0;
@@ -563,7 +563,7 @@ void elasticsearch_plugin_impl::upsert_account(
       } else if( act.name == setabi ) {
          auto setabi = act.data_as<chain::setabi>();
 
-         abi_deserializer->erase_abi_cache( setabi.account );
+         abi_pool->erase_abi_cache( setabi.account );
 
          upsert_account_setabi(param_doc, setabi, now);
          account_id = setabi.account.value;
@@ -670,7 +670,7 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
          for (auto& p : base_action_traces) {
             fc::mutable_variant_object action_traces_doc;
             chain::base_action_trace &base = p.second.get();
-            fc::from_variant( abi_deserializer->to_variant_with_abi( base ), action_traces_doc );
+            fc::from_variant( abi_pool->get().to_variant_with_abi( base ), action_traces_doc );
             action_traces_doc("createAt", now.count());
 
             auto id = boost::str(boost::format("%1%-%2%") % trx_id_str % p.first);
@@ -692,7 +692,7 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
             // transaction trace index
 
             fc::mutable_variant_object trans_traces_doc;
-            fc::from_variant( abi_deserializer->to_variant_with_abi( *t ), trans_traces_doc );
+            fc::from_variant( abi_pool->get().to_variant_with_abi( *t ), trans_traces_doc );
             trans_traces_doc("createAt", now.count());
 
             fc::mutable_variant_object action_doc;
@@ -730,7 +730,7 @@ void elasticsearch_plugin_impl::_process_accepted_transaction( chain::transactio
          auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::microseconds{fc::time_point::now().time_since_epoch().count()} );
 
-         fc::from_variant( abi_deserializer->to_variant_with_abi( trx ), trans_doc );
+         fc::from_variant( abi_pool->get().to_variant_with_abi( trx ), trans_doc );
          trans_doc("trx_id", trx_id_str);
 
          fc::variant signing_keys;
@@ -835,7 +835,7 @@ void elasticsearch_plugin_impl::_process_accepted_block( chain::block_state_ptr 
 
             params_doc("block_num", static_cast<int32_t>(block_num));
             params_doc("block_id", block_id_str);
-            params_doc("block", abi_deserializer->to_variant_with_abi( *bs->block ));
+            params_doc("block", abi_pool->get().to_variant_with_abi( *bs->block ));
             params_doc("irreversible", false);
             params_doc("createAt", now.count());
 
@@ -925,7 +925,7 @@ void elasticsearch_plugin_impl::_process_irreversible_block(chain::block_state_p
 
             block_doc("block_num", static_cast<int32_t>(block_num));
             block_doc("block_id", block_id_str);
-            block_doc("block", abi_deserializer->to_variant_with_abi( *bs->block ));
+            block_doc("block", abi_pool->get().to_variant_with_abi( *bs->block ));
             block_doc("irreversible", true);
             block_doc("validated", bs->validated);
             block_doc("createAt", now.count());
@@ -1288,15 +1288,16 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          size_t bulk_size = options.at( "elastic-bulk-size" ).as<size_t>();
 
          my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), user_str, password_str) );
-         my->abi_deserializer.reset( new deserializer(
-               my->abi_cache_size, my->abi_serializer_max_time, std::vector<std::string>({url_str}), user_str, password_str) );
+         my->abi_pool.reset( new deserializer_pool( thr_pool_size, my->abi_cache_size, my->abi_serializer_max_time,
+                                                    std::vector<std::string>({url_str}), user_str, password_str) );
 
          ilog("init thread pool, size: ${tps}", ("tps", thr_pool_size));
          my->thread_pool.reset( new ThreadPool(thr_pool_size) );
          my->max_task_queue_size = my->max_queue_size;
 
          ilog("init bulker pool, size: ${bps}, bulk size: ${bs}mb", ("bps", bulk_pool_size)("bs", bulk_size));
-         my->bulk_pool.reset( new bulker_pool(bulk_pool_size, bulk_size * 1024 * 1024, std::vector<std::string>({url_str}), user_str, password_str) );
+         my->bulk_pool.reset( new bulker_pool(bulk_pool_size, bulk_size * 1024 * 1024,
+                              std::vector<std::string>({url_str}), user_str, password_str) );
 
          // hook up to signals on controller
          chain_plugin* chain_plug = app().find_plugin<chain_plugin>();

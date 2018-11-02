@@ -8,7 +8,6 @@ namespace eosio
 {
 
 void deserializer::purge_abi_cache() {
-   std::lock_guard<std::mutex> gurad(cache_mtx);
    if( abi_cache_index.size() < abi_cache_size ) return;
 
    // remove the oldest (smallest) last accessed
@@ -49,6 +48,7 @@ optional<abi_serializer> deserializer::find_abi_cache(const account_name &name) 
 
 void deserializer::insert_abi_cache( const abi_cache &entry ) {
    std::lock_guard<std::mutex> gurad(cache_mtx);
+   purge_abi_cache(); // make room if necessary
    abi_cache_index.insert( entry );
 }
 
@@ -77,7 +77,6 @@ optional<abi_serializer> deserializer::get_abi_serializer( const account_name &n
                return optional<abi_serializer>();
             }
 
-            purge_abi_cache(); // make room if necessary
             abi_cache entry;
             entry.account = name;
             entry.last_accessed = fc::time_point::now();
@@ -118,6 +117,33 @@ optional<abi_serializer> deserializer::get_abi_serializer( const account_name &n
       } FC_CAPTURE_AND_LOG((name))
    }
    return optional<abi_serializer>();
+}
+
+
+deserializer_pool::deserializer_pool(size_t pool_size,
+               size_t cache_size, fc::microseconds abi_serializer_max_time,
+               const std::vector<std::string> url_list,
+               const std::string &user, const std::string &password): pool_size(pool_size)
+{
+   for (int i = 0; i < pool_size; ++i) {
+      deserializers.emplace_back( new deserializer(cache_size, abi_serializer_max_time, url_list, user, password) );
+   }
+}
+
+deserializer& deserializer_pool::get() {
+
+   size_t cur_idx = index;
+
+   cur_idx = (cur_idx + 1) % pool_size;
+   auto ptr = deserializers[cur_idx].get();
+
+   return *ptr;
+}
+
+void deserializer_pool::erase_abi_cache(const account_name &name) {
+   for (auto& deserializer : deserializers) {
+      deserializer->erase_abi_cache(name);
+   }
 }
 
 }

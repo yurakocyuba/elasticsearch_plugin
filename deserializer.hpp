@@ -61,4 +61,21 @@ private:
 
 };
 
+class deserializer_pool
+{
+public:
+   deserializer_pool(size_t pool_size,
+               size_t cache_size, fc::microseconds abi_serializer_max_time,
+               const std::vector<std::string> url_list,
+               const std::string &user, const std::string &password);
+
+   deserializer& get();
+   void erase_abi_cache(const account_name &name);
+
+private:
+   std::vector<std::unique_ptr<deserializer>> deserializers;
+   size_t pool_size;
+   std::atomic<size_t> index {0};
+};
+
 }
