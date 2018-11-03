@@ -146,4 +146,10 @@ void deserializer_pool::erase_abi_cache(const account_name &name) {
    }
 }
 
+void deserializer_pool::insert_abi_cache(const abi_cache &entry) {
+   for (auto& deserializer : deserializers) {
+      deserializer->insert_abi_cache(entry);
+   }
+}
+
 }

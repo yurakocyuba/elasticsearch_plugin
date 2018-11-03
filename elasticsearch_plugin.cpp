@@ -505,6 +505,15 @@ void elasticsearch_plugin_impl::upsert_account_setabi(
 {
    abi_def abi_def = fc::raw::unpack<chain::abi_def>( setabi.abi );
 
+   abi_pool->erase_abi_cache( setabi.account );
+   abi_cache entry;
+   entry.account = setabi.account;
+   entry.last_accessed = fc::time_point::now();
+   abi_serializer abis;
+   abis.set_abi( abi_def, abi_serializer_max_time );
+   entry.serializer.emplace( std::move( abis ) );
+   abi_pool->insert_abi_cache( entry );
+
    param_doc("name", setabi.account.to_string());
    param_doc("abi", abi_def);
    param_doc("updateAt", now.count());
@@ -562,8 +571,6 @@ void elasticsearch_plugin_impl::upsert_account(
 
       } else if( act.name == setabi ) {
          auto setabi = act.data_as<chain::setabi>();
-
-         abi_pool->erase_abi_cache( setabi.account );
 
          upsert_account_setabi(param_doc, setabi, now);
          account_id = setabi.account.value;
@@ -1216,11 +1223,12 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
                                  " --elastic-index-wipe will remove EOS index from elasticsearch." );
             }
          }
-
-         if( options.count( "abi-serializer-max-time-ms") == 0 ) {
-            EOS_ASSERT(false, chain::plugin_config_exception, "--abi-serializer-max-time-ms required as default value not appropriate for parsing full blocks");
+         if( options.count( "abi-serializer-max-time-ms" )) {
+            uint32_t max_time = options.at( "abi-serializer-max-time-ms" ).as<uint32_t>();
+            EOS_ASSERT(max_time > chain::config::default_abi_serializer_max_time_ms,
+                       chain::plugin_config_exception, "--abi-serializer-max-time-ms required as default value not appropriate for parsing full blocks");
+            my->abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
          }
-         my->abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
 
          if( options.count( "elastic-queue-size" )) {
             my->max_queue_size = options.at( "elastic-queue-size" ).as<uint32_t>();
