@@ -665,6 +665,8 @@ void elasticsearch_plugin_impl::_process_irreversible_block(chain::block_state_p
          {
             fc::mutable_variant_object doc;
             fc::from_variant( abi_deserializer->to_variant_with_abi( *bs->block ), doc );
+            doc("block_num", static_cast<int32_t>(block_num));
+            doc("block_id", block_id_str);
 
             fc::mutable_variant_object action_doc;
             action_doc("_index", blocks_index);
