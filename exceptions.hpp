@@ -33,10 +33,9 @@ inline void handle_elasticsearch_exception( const std::string& desc, int line_nu
          elog( "elasticsearch exception, ${desc}, line ${line}, ${what}",
                ("desc", desc)( "line", line_num )( "what", e.to_detail_string() ));
       } catch( chain::bulk_fail_exception& e) {
-         wlog( "elasticsearch exception, ${desc}, line ${line}, ${what}",
+         elog( "elasticsearch exception, ${desc}, line ${line}, ${what}",
                ("desc", desc)( "line", line_num )( "what", e.to_detail_string() ));
-         shutdown = false;
-       } catch( fc::exception& er ) {
+      } catch( fc::exception& er ) {
          elog( "elasticsearch fc exception, ${desc}, line ${line}, ${details}",
                ("desc", desc)( "line", line_num )( "details", er.to_detail_string()));
       } catch( const std::exception& e ) {

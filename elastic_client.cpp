@@ -1,3 +1,4 @@
+// #include <iostream>
 #include <cpr/response.h>
 
 #include <fc/io/json.hpp>
@@ -20,6 +21,23 @@ bool is_2xx(int32_t status_code)
    return status_code > 199 && status_code < 300;
 }
 } // namespace
+
+elastic_client::elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool to_file)
+   :client(url_list, "", "", std::numeric_limits<int32_t>::max()), filename(filename), to_file(to_file)
+{
+   if ( !boost::filesystem::exists(filename) || boost::filesystem::is_empty(filename) ) {
+      ofs.reset( new boost::filesystem::ofstream(filename) );
+   } else {
+      wlog("retransfer bulk content: ${p}", ("p", filename));
+      boost::filesystem::ifstream f(filename);
+      std::string content((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+      f.close();
+      boost::filesystem::remove(filename);
+      ofs.reset( new boost::filesystem::ofstream(filename)) ;
+      bulk_perform( content );
+   }
+}
 
 bool elastic_client::head(const std::string &url_path)
 {
@@ -99,25 +117,26 @@ void elastic_client::delete_by_query(const std::string &index_name, const std::s
    EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
 }
 
-void elastic_client::bulk_perform(elasticlient::SameIndexBulkData &bulk)
-{
-   auto index_name = bulk.indexName();
-   auto body = bulk.body();
-   auto url = boost::str(boost::format("%1%/_bulk") % index_name);
-   cpr::Response resp = client.performRequest(elasticlient::Client::HTTPMethod::POST, url, body);
-   EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
-   
-   fc::variant text_doc( fc::json::from_string(resp.text) );
-   EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
-}
-
 void elastic_client::bulk_perform(const std::string &bulk)
 {
-   cpr::Response resp = client.performRequest(elasticlient::Client::HTTPMethod::POST, "_bulk", bulk);
-   EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
-   
-   fc::variant text_doc( fc::json::from_string(resp.text) );
-   EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
+   if (to_file) {
+      ilog("write bulk content ot: ${p}", ("p", filename));
+      *ofs << bulk;
+      return;
+   }
+
+   try {
+      cpr::Response resp = client.performRequest(elasticlient::Client::HTTPMethod::POST, "_bulk", bulk);
+      EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
+      
+      fc::variant text_doc( fc::json::from_string(resp.text) );
+      EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
+   } catch( ... ) {
+      ilog("write bulk content ot: ${p}", ("p", filename));
+      to_file = true;
+      *ofs << bulk;
+      throw;
+   }
 }
 
 void elastic_client::update(const std::string &index_name, const std::string &id, const std::string &body)

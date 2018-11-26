@@ -4,14 +4,13 @@
 #include <fc/variant.hpp>
 #include <elasticlient/client.h>
 #include <elasticlient/bulk.h>
-
+#include <boost/filesystem.hpp>
 namespace eosio {
 
 class elastic_client
 {
 public:
-   elastic_client(const std::vector<std::string> url_list, const std::string &user, const std::string &password)
-      :client(url_list, user, password, std::numeric_limits<int32_t>::max()) {};
+   elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool to_file);
 
    void delete_index(const std::string &index_name);
    void init_index(const std::string &index_name, const std::string &mappings);
@@ -23,11 +22,13 @@ public:
    uint64_t count_doc(const std::string &index_name, const std::string &query = std::string());
    void search(const std::string &index_name, fc::variant& v, const std::string &query);
    void delete_by_query(const std::string &index_name, const std::string &query);
-   void bulk_perform(elasticlient::SameIndexBulkData &bulk);
    void bulk_perform(const std::string &bulk);
    void update(const std::string &index_name, const std::string &id, const std::string &body);
 
    elasticlient::Client client;
+   boost::filesystem::path filename;
+   std::unique_ptr<boost::filesystem::ofstream> ofs;
+   bool to_file = false;
 };
 
 }

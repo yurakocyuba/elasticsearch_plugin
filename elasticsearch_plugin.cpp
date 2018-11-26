@@ -28,8 +28,6 @@
 
 #include "elastic_client.hpp"
 #include "exceptions.hpp"
-#include "mappings.hpp"
-#include "deserializer.hpp"
 #include "bulker.hpp"
 #include "ThreadPool/ThreadPool.h"
 
@@ -70,15 +68,11 @@ public:
    elasticsearch_plugin_impl();
    ~elasticsearch_plugin_impl();
 
+
    fc::optional<boost::signals2::scoped_connection> irreversible_block_connection;
    fc::optional<boost::signals2::scoped_connection> applied_transaction_connection;
 
-   void consume_blocks();
-
    void check_task_queue_size();
-
-   void applied_irreversible_block(const chain::block_state_ptr&);
-   void applied_transaction(const chain::transaction_trace_ptr&);
 
    void process_applied_transaction(chain::transaction_trace_ptr);
    void _process_applied_transaction(chain::transaction_trace_ptr);
@@ -100,8 +94,6 @@ public:
 
    void init();
 
-   template<typename Queue, typename Entry> void queue(Queue& queue, const Entry& e);
-
    uint32_t start_block_num = 0;
    std::atomic_bool start_block_reached{false};
 
@@ -109,28 +101,20 @@ public:
    std::set<filter_entry> filter_on;
    std::set<filter_entry> filter_out;
 
-   std::unique_ptr<elastic_client> es_client;
-   std::unique_ptr<deserializer> abi_deserializer;
-   std::unique_ptr<bulker_pool> bulk_pool;
-   std::unique_ptr<ThreadPool> thread_pool;
    size_t max_task_queue_size = 0;
    int task_queue_sleep_time = 0;
 
-   std::queue<std::function<void()>> upsert_account_task_queue;
-   boost::mutex upsert_account_task_mtx;
-
-   size_t max_queue_size = 0;
-   int queue_sleep_time = 0;
    std::deque<chain::transaction_trace_ptr> transaction_trace_queue;
-   std::deque<chain::transaction_trace_ptr> transaction_trace_process_queue;
-   std::deque<chain::block_state_ptr> irreversible_block_state_queue;
-   std::deque<chain::block_state_ptr> irreversible_block_state_process_queue;
-   boost::mutex mtx;
-   boost::condition_variable condition;
-   boost::thread consume_thread;
-   boost::atomic<bool> done{false};
-   boost::atomic<bool> startup{true};
+   boost::mutex trx_que_mtx;
+
    fc::optional<chain::chain_id_type> chain_id;
+
+   fc::microseconds abi_serializer_max_time;
+
+   abi_cache_plugin* abi_cache_plug;
+   std::unique_ptr<elastic_client> es_client;
+   std::vector<std::unique_ptr<bulker>> bulkers;
+   std::unique_ptr<ThreadPool> thread_pool;
 
    static const action_name newaccount;
    static const action_name setabi;
@@ -140,7 +124,6 @@ public:
    static const permission_name active;
 
    static const std::string accounts_index;
-   static const std::string blocks_index;
    static const std::string block_states_index;
    static const std::string trans_traces_index;
    static const std::string action_traces_index;
@@ -154,7 +137,6 @@ const permission_name elasticsearch_plugin_impl::owner = chain::config::owner_na
 const permission_name elasticsearch_plugin_impl::active = chain::config::active_name;
 
 const std::string elasticsearch_plugin_impl::accounts_index = "accounts";
-const std::string elasticsearch_plugin_impl::blocks_index = "blocks";
 const std::string elasticsearch_plugin_impl::block_states_index = "block_states";
 const std::string elasticsearch_plugin_impl::trans_traces_index = "transaction_traces";
 const std::string elasticsearch_plugin_impl::action_traces_index = "action_traces";
@@ -231,92 +213,15 @@ elasticsearch_plugin_impl::elasticsearch_plugin_impl()
 
 elasticsearch_plugin_impl::~elasticsearch_plugin_impl()
 {
-   if (!startup) {
-      try {
-         ilog( "elasticsearch_plugin shutdown in process please be patient this can take a few minutes" );
-         done = true;
-         condition.notify_one();
-
-         consume_thread.join();
-      } catch( std::exception& e ) {
-         elog( "Exception on elasticsearch_plugin shutdown of consume thread: ${e}", ("e", e.what()));
-      }
-   }
+   ilog( "elasticsearch_plugin shutdown in process please be patient this can take a few minutes" );
 }
-
-template<typename Queue, typename Entry>
-void elasticsearch_plugin_impl::queue( Queue& queue, const Entry& e ) {
-   boost::mutex::scoped_lock lock( mtx );
-   auto queue_size = queue.size();
-   if( queue_size > max_queue_size ) {
-      lock.unlock();
-      condition.notify_one();
-      queue_sleep_time += 10;
-      if( queue_sleep_time > 1000 )
-         wlog("queue size: ${q}", ("q", queue_size));
-      boost::this_thread::sleep_for( boost::chrono::milliseconds( queue_sleep_time ));
-      lock.lock();
-   } else {
-      queue_sleep_time -= 10;
-      if( queue_sleep_time < 0 ) queue_sleep_time = 0;
-   }
-   queue.emplace_back( e );
-   lock.unlock();
-   condition.notify_one();
-}
-
-void elasticsearch_plugin_impl::applied_transaction( const chain::transaction_trace_ptr& t ) {
-   try {
-      // Traces emitted from an incomplete block leave the producer_block_id as empty.
-      //
-      // Avoid adding the action traces or transaction traces to the database if the producer_block_id is empty.
-      // This way traces from speculatively executed transactions are not included in the Elasticsearch which can
-      // avoid potential confusion for consumers of that database.
-      //
-      // Due to forks, it could be possible for multiple incompatible action traces with the same block_num and trx_id
-      // to exist in the database. And if the producer double produces a block, even the block_time may not
-      // disambiguate the two action traces. Without a producer_block_id to disambiguate and determine if the action
-      // trace comes from an orphaned fork branching off of the blockchain, consumers of the Mongo DB database may be
-      // reacting to a stale action trace that never actually executed in the current blockchain.
-      //
-      // It is better to avoid this potential confusion by not logging traces from speculative execution, i.e. emitted
-      // from an incomplete block. This means that traces will not be recorded in speculative read-mode, but
-      // users should not be using the elasticsearch_plugin in that mode anyway.
-      //
-      // Allow logging traces if node is a producer for testing purposes, so a single nodeos can do both for testing.
-      //
-      // It is recommended to run elasticsearch_plugin in read-mode = read-only.
-      //
-      if( !t->producer_block_id.valid() )
-         return;
-      // always queue since account information always gathered
-      queue( transaction_trace_queue, t );
-   } catch (fc::exception& e) {
-      elog("FC Exception while applied_transaction ${e}", ("e", e.to_string()));
-   } catch (std::exception& e) {
-      elog("STD Exception while applied_transaction ${e}", ("e", e.what()));
-   } catch (...) {
-      elog("Unknown exception while applied_transaction");
-   }
-}
-
-void elasticsearch_plugin_impl::applied_irreversible_block( const chain::block_state_ptr& bs ) {
-   try {
-      queue( irreversible_block_state_queue, bs );
-   } catch (fc::exception& e) {
-      elog("FC Exception while applied_irreversible_block ${e}", ("e", e.to_string()));
-   } catch (std::exception& e) {
-      elog("STD Exception while applied_irreversible_block ${e}", ("e", e.what()));
-   } catch (...) {
-      elog("Unknown exception while applied_irreversible_block");
-   }
-}
-
 
 void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
    try {
       // always call since we need to capture setabi on accounts even if not storing transaction traces
-      _process_applied_transaction( std::move(t) );
+      if( !t->producer_block_id.valid() )
+         return;
+      _process_applied_transaction( t );
    } catch (fc::exception& e) {
       elog("FC Exception while processing applied transaction trace: ${e}", ("e", e.to_detail_string()));
    } catch (std::exception& e) {
@@ -329,7 +234,7 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
 void elasticsearch_plugin_impl::process_irreversible_block( chain::block_state_ptr bs) {
   try {
      if( start_block_reached ) {
-        _process_irreversible_block( std::move(bs) );
+        _process_irreversible_block( bs );
      }
   } catch (fc::exception& e) {
      elog("FC Exception while processing irreversible block: ${e}", ("e", e.to_detail_string()));
@@ -418,8 +323,6 @@ void elasticsearch_plugin_impl::upsert_account_setabi(
 {
    abi_def abi_def = fc::raw::unpack<chain::abi_def>( setabi.abi );
 
-   abi_deserializer->upsert_abi_cache( setabi.account, abi_def );
-
    param_doc("name", setabi.account.to_string());
    param_doc("abi", abi_def);
 }
@@ -501,131 +404,154 @@ void elasticsearch_plugin_impl::upsert_account(
 
 void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction_trace_ptr t ) {
 
-   std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> account_upsert_actions;
-   std::vector<std::reference_wrapper<chain::base_action_trace>> base_action_traces; // without inline action traces
+   transaction_trace_queue.emplace_back(t);
 
-   bool executed = t->receipt.valid() && t->receipt->status == chain::transaction_receipt_header::executed;
-
-   std::stack<std::reference_wrapper<chain::action_trace>> stack;
-   for( auto& atrace : t->action_traces ) {
-      stack.emplace(atrace);
-
-      while ( !stack.empty() )
-      {
-         auto &atrace = stack.top().get();
-         stack.pop();
-
-         if( executed && atrace.receipt.receiver == chain::config::system_account_name ) {
-            upsert_account( account_upsert_actions, atrace.act, atrace.block_time );
-         }
-
-         if( start_block_reached && filter_include( atrace.receipt.receiver, atrace.act.name, atrace.act.authorization ) ) {
-            base_action_traces.emplace_back( atrace );
-         }
-
-         auto &inline_traces = atrace.inline_traces;
-         for( auto it = inline_traces.rbegin(); it != inline_traces.rend(); ++it ) {
-            stack.emplace(*it);
-         }
-      }
-   }
-
-   if ( !account_upsert_actions.empty() ) {
-
-      auto f =  [ account_upsert_actions{std::move(account_upsert_actions)}, this ]()
-      {
-         elasticlient::SameIndexBulkData bulk_account_upserts(accounts_index);
-         for( auto& action : account_upsert_actions ) {
-
-            fc::mutable_variant_object source_doc;
-            fc::mutable_variant_object script_doc;
-
-            script_doc("lang", "painless");
-            script_doc("source", action.second.first);
-            script_doc("params", action.second.second);
-
-            source_doc("scripted_upsert", true);
-            source_doc("upsert", fc::variant_object());
-            source_doc("script", script_doc);
-
-            auto id = std::to_string(action.first);
-            auto json = fc::json::to_string(source_doc);
-
-            bulk_account_upserts.updateDocument("_doc", id, json);
-         }
-
-         try {
-            es_client->bulk_perform(bulk_account_upserts);
-         } catch( ... ) {
-            handle_elasticsearch_exception( "upsert accounts " + bulk_account_upserts.body(), __LINE__ );
-         }
-      };
-
-      upsert_account_task_queue.emplace( std::move(f) );
-
-      check_task_queue_size();
-      thread_pool->enqueue(
-         [ this ]()
-         {
-            boost::mutex::scoped_lock guard(upsert_account_task_mtx);
-            std::function<void()> task = std::move( upsert_account_task_queue.front() );
-            task();
-            upsert_account_task_queue.pop();
-         }
-      );
-
-   }
-
-   if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
    check_task_queue_size();
    thread_pool->enqueue(
-      [ t{std::move(t)}, base_action_traces{std::move(base_action_traces)}, this ]()
+      [ this ](size_t thread_idx)
       {
-         const auto& trx_id = t->id;
-         const auto trx_id_str = trx_id.str();
-
-         for (auto& atrace : base_action_traces) {
-            fc::mutable_variant_object action_traces_doc;
-            chain::base_action_trace &base = atrace.get();
-            fc::from_variant( abi_deserializer->to_variant_with_abi( base ), action_traces_doc );
-
-            fc::mutable_variant_object act_doc;
-            fc::from_variant( action_traces_doc["act"], act_doc );
-            act_doc["data"] = fc::json::to_string( act_doc["data"] );
-
-            action_traces_doc["act"] = act_doc;
-
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", action_traces_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", action_traces_doc["receipt"]["global_sequence"]);
-            action_doc("retry_on_conflict", 100);
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
-         }
+         chain::transaction_trace_ptr t;
+         std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> account_upsert_actions;
+         std::vector<std::reference_wrapper<chain::base_action_trace>> base_action_traces; // without inline action traces
 
          {
-            // transaction trace index
+            boost::unique_lock<boost::mutex> lock(trx_que_mtx);
+            t = transaction_trace_queue.front();
+            transaction_trace_queue.pop_front();
 
-            fc::mutable_variant_object trans_traces_doc;
-            fc::from_variant( abi_deserializer->to_variant_with_abi( *t ), trans_traces_doc );
+            bool executed = t->receipt.valid() && t->receipt->status == chain::transaction_receipt_header::executed;
 
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", trans_traces_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", trx_id_str);
+            std::stack<std::reference_wrapper<chain::action_trace>> stack;
+            for( auto& atrace : t->action_traces ) {
+               stack.emplace(atrace);
 
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::prune_invalid_utf8( fc::json::to_string( trans_traces_doc ) );
+               while ( !stack.empty() )
+               {
+                  auto &atrace = stack.top().get();
+                  stack.pop();
 
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
+                  if( executed && atrace.receipt.receiver == chain::config::system_account_name ) {
+                     upsert_account( account_upsert_actions, atrace.act, atrace.block_time );
+                  }
 
+                  if( start_block_reached && filter_include( atrace.receipt.receiver, atrace.act.name, atrace.act.authorization ) ) {
+                     base_action_traces.emplace_back( atrace );
+                  }
+
+                  auto &inline_traces = atrace.inline_traces;
+                  for( auto it = inline_traces.rbegin(); it != inline_traces.rend(); ++it ) {
+                     stack.emplace(*it);
+                  }
+               }
+            }
+
+            if ( !account_upsert_actions.empty() ) {
+
+               std::string bulk = "";
+               for( auto& action : account_upsert_actions ) {
+
+                  fc::mutable_variant_object source_doc;
+                  fc::mutable_variant_object script_doc;
+
+                  script_doc("lang", "painless");
+                  script_doc("source", action.second.first);
+                  script_doc("params", action.second.second);
+
+                  source_doc("scripted_upsert", true);
+                  source_doc("upsert", fc::variant_object());
+                  source_doc("script", script_doc);
+
+                  auto id = std::to_string(action.first);
+                  auto json = fc::json::to_string(source_doc);
+
+                  fc::mutable_variant_object action_doc;
+                  action_doc("_index", accounts_index);
+                  action_doc("_type", "_doc");
+                  action_doc("_id", id);
+
+                  auto es_action = fc::json::to_string( fc::variant_object("index", action_doc) );
+
+                  bulk += es_action + '\n';
+                  bulk += json + '\n';
+               }
+
+               try {
+                  es_client->bulk_perform(bulk);
+               } catch( ... ) {
+                  handle_elasticsearch_exception( "upsert accounts", __LINE__ );
+               }
+            }
          }
+
+         if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
+
+         thread_pool->enqueue(
+            [ t, base_action_traces{std::move(base_action_traces)}, this ](size_t thread_idx)
+            {
+               const auto& trx_id = t->id;
+               const auto trx_id_str = trx_id.str();
+
+               for (auto& atrace : base_action_traces) {
+                  fc::mutable_variant_object action_traces_doc;
+                  chain::base_action_trace &base = atrace.get();
+                  auto &name = base.act.account;
+                  auto &abi_sequence = base.receipt.abi_sequence;
+
+                  auto func = [&]( account_name n ) {
+                     EOS_ASSERT( n == name, chain::elasticsearch_exception, "mismatch abi account name" );
+                     return abi_cache_plug->get_abi_serializer( name, abi_sequence );
+                  };
+
+                  while ( abi_sequence > abi_cache_plug->global_sequence_height()) {
+                     wlog("action trace global sequence: ${n}", ("n", abi_sequence));
+                     boost::this_thread::sleep_for( boost::chrono::milliseconds( 5 ));
+                  }
+
+                  fc::variant pretty_output;
+                  abi_serializer::to_variant( base, pretty_output, func, abi_serializer_max_time );
+
+                  fc::from_variant( pretty_output, action_traces_doc );
+
+                  fc::mutable_variant_object act_doc;
+                  fc::from_variant( action_traces_doc["act"], act_doc );
+                  act_doc["text_data"] = fc::json::to_string( act_doc["data"] );
+
+                  action_traces_doc["act"] = act_doc;
+
+                  fc::mutable_variant_object action_doc;
+                  action_doc("_index", action_traces_index);
+                  action_doc("_type", "_doc");
+                  action_doc("_id", action_traces_doc["receipt"]["global_sequence"]);
+
+                  auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+                  auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
+
+                  bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+               }
+            }
+         );
+
+         thread_pool->enqueue(
+            [ t, this ](size_t thread_idx)
+            {
+               // transaction trace index
+               const auto& trx_id = t->id;
+               const auto trx_id_str = trx_id.str();
+
+               fc::mutable_variant_object trans_traces_doc(*t);
+
+               fc::mutable_variant_object action_doc;
+               action_doc("_index", trans_traces_index);
+               action_doc("_type", "_doc");
+               action_doc("_id", trx_id_str);
+
+               auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+               auto json = fc::json::to_string( trans_traces_doc );
+
+               bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+
+            }
+         );
       }
    );
 
@@ -634,52 +560,22 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
 void elasticsearch_plugin_impl::_process_irreversible_block(chain::block_state_ptr bs) {
    check_task_queue_size();
    thread_pool->enqueue(
-      [ bs{std::move(bs)}, this ]()
+      [ bs, this ](size_t thread_idx)
       {
          const auto block_id = bs->block->id();
          const auto block_id_str = block_id.str();
-         const auto block_num = bs->block->block_num();
 
-         {
-            fc::mutable_variant_object doc;
+         fc::mutable_variant_object doc(*bs);
 
-            doc("block_num", static_cast<int32_t>(block_num));
-            doc("block_id", block_id_str);
-            doc("block_header_state", bs);
-            doc("validated", bs->validated);
-            doc("irreversible", true);
+         fc::mutable_variant_object action_doc;
+         action_doc("_index", block_states_index);
+         action_doc("_type", "_doc");
+         action_doc("_id", block_id_str);
 
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", block_states_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", block_id_str);
+         auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+         auto json = fc::json::to_string( doc );
 
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::json::to_string( doc );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
-         }
-
-         {
-            fc::mutable_variant_object doc;
-            fc::from_variant( abi_deserializer->to_variant_with_abi( *bs->block ), doc );
-            doc("block_num", static_cast<int32_t>(block_num));
-            doc("block_id", block_id_str);
-
-            fc::mutable_variant_object action_doc;
-            action_doc("_index", blocks_index);
-            action_doc("_type", "_doc");
-            action_doc("_id", block_id_str);
-
-
-            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-            auto json = fc::prune_invalid_utf8( fc::json::to_string( doc ) );
-
-            bulker& bulk = bulk_pool->get();
-            bulk.append_document(std::move(action), std::move(json));
-         }
+         bulkers[thread_idx]->append_document(std::move(action), std::move(json));
 
       }
    );
@@ -697,78 +593,6 @@ void elasticsearch_plugin_impl::check_task_queue_size() {
       if( task_queue_sleep_time < 0 ) task_queue_sleep_time = 0;
    }
 }
-
-void elasticsearch_plugin_impl::consume_blocks() {
-   try {
-      while (true) {
-         boost::mutex::scoped_lock lock(mtx);
-         while ( transaction_trace_queue.empty() &&
-                 irreversible_block_state_queue.empty() &&
-                 !done ) {
-            condition.wait(lock);
-         }
-
-         // capture for processing
-         size_t transaction_trace_size = transaction_trace_queue.size();
-         if (transaction_trace_size > 0) {
-            transaction_trace_process_queue = move(transaction_trace_queue);
-            transaction_trace_queue.clear();
-         }
-
-         size_t irreversible_block_size = irreversible_block_state_queue.size();
-         if (irreversible_block_size > 0) {
-            irreversible_block_state_process_queue = move(irreversible_block_state_queue);
-            irreversible_block_state_queue.clear();
-         }
-
-         lock.unlock();
-
-         if (done) {
-            ilog("draining queue, size: ${q}", ("q", transaction_trace_size + irreversible_block_size));
-         }
-
-         // process transactions
-         auto start_time = fc::time_point::now();
-         auto size = transaction_trace_process_queue.size();
-         while (!transaction_trace_process_queue.empty()) {
-            const auto& t = transaction_trace_process_queue.front();
-            process_applied_transaction(t);
-            transaction_trace_process_queue.pop_front();
-         }
-         auto time = fc::time_point::now() - start_time;
-         auto per = size > 0 ? time.count()/size : 0;
-         if( time > fc::seconds(5) ) // reduce logging, 5 secs
-            ilog( "process_applied_transaction,  time per: ${p}, size: ${s}, time: ${t}", ("s", size)("t", time)("p", per) );
-
-         // process irreversible blocks
-         start_time = fc::time_point::now();
-         size = irreversible_block_state_process_queue.size();
-         while (!irreversible_block_state_process_queue.empty()) {
-            const auto& bs = irreversible_block_state_process_queue.front();
-            process_irreversible_block(bs);
-            irreversible_block_state_process_queue.pop_front();
-         }
-         time = fc::time_point::now() - start_time;
-         per = size > 0 ? time.count()/size : 0;
-         if( time > fc::seconds(5) ) // reduce logging, 5 secs
-            ilog( "process_irreversible_block,   time per: ${p}, size: ${s}, time: ${t}", ("s", size)("t", time)("p", per) );
-
-         if( transaction_trace_size == 0 &&
-             irreversible_block_size == 0 &&
-             done ) {
-            break;
-         }
-      }
-      ilog("elasticsearch_plugin consume thread shutdown gracefully");
-   } catch (fc::exception& e) {
-      elog("FC Exception while consuming block ${e}", ("e", e.to_string()));
-   } catch (std::exception& e) {
-      elog("STD Exception while consuming block ${e}", ("e", e.what()));
-   } catch (...) {
-      elog("Unknown exception while consuming block");
-   }
-}
-
 
 void elasticsearch_plugin_impl::init() {
    if (es_client->count_doc(accounts_index) == 0) {
@@ -788,10 +612,6 @@ void elasticsearch_plugin_impl::init() {
       }
    }
 
-   ilog("starting elasticsearch plugin thread");
-   consume_thread = boost::thread([this] { consume_blocks(); });
-
-   startup = false;
 }
 
 elasticsearch_plugin::elasticsearch_plugin():my(new elasticsearch_plugin_impl()){}
@@ -799,21 +619,21 @@ elasticsearch_plugin::~elasticsearch_plugin(){}
 
 void elasticsearch_plugin::set_program_options(options_description&, options_description& cfg) {
    cfg.add_options()
-         ("elastic-queue-size,q", bpo::value<uint32_t>()->default_value(1024),
-         "The target queue size between nodeos and elasticsearch plugin thread.")
-         ("elastic-thread-pool-size", bpo::value<size_t>()->default_value(4),
-          "The size of the data processing thread pool.")
-         ("elastic-bulk-size", bpo::value<size_t>()->default_value(5),
-          "The size(megabytes) of the each bulk request.")
-         ("elastic-block-start", bpo::value<uint32_t>()->default_value(0),
+      ("elastic-thread-pool-size", bpo::value<size_t>()->default_value(4),
+         "The size of the data processing thread pool.")
+      ("elastic-bulk-size", bpo::value<size_t>()->default_value(5),
+         "The size(megabytes) of the each bulk request.")
+      ("elastic-block-start", bpo::value<uint32_t>()->default_value(0),
          "If specified then only abi data pushed to elasticsearch until specified block is reached.")
-         ("elastic-url,u", bpo::value<std::string>(),
+      ("elastic-url,u", bpo::value<std::string>(),
          "elasticsearch URL connection string If not specified then plugin is disabled.")
-         ("elastic-filter-on", bpo::value<vector<string>>()->composing(),
-          "Track actions which match receiver:action:actor. Receiver, Action, & Actor may be blank to include all. i.e. eosio:: or :transfer:  Use * or leave unspecified to include all.")
-         ("elastic-filter-out", bpo::value<vector<string>>()->composing(),
-          "Do not track actions which match receiver:action:actor. Receiver, Action, & Actor may be blank to exclude all.")
-         ;
+      ("elastic-filter-on", bpo::value<vector<string>>()->composing(),
+         "Track actions which match receiver:action:actor. Receiver, Action, & Actor may be blank to include all. i.e. eosio:: or :transfer:  Use * or leave unspecified to include all.")
+      ("elastic-filter-out", bpo::value<vector<string>>()->composing(),
+         "Do not track actions which match receiver:action:actor. Receiver, Action, & Actor may be blank to exclude all.")
+      ("elastic-dry-run", bpo::bool_switch()->default_value(false),
+         "If enabled bulk content will be write into files instead of elasticsearch.")
+      ;
 }
 
 void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
@@ -825,13 +645,9 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
             uint32_t max_time = options.at( "abi-serializer-max-time-ms" ).as<uint32_t>();
             EOS_ASSERT(max_time > chain::config::default_abi_serializer_max_time_ms,
                        chain::plugin_config_exception, "--abi-serializer-max-time-ms required as default value not appropriate for parsing full blocks");
-            fc::microseconds abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
-            my->abi_deserializer.reset( new deserializer( abi_serializer_max_time ));
+            my->abi_serializer_max_time = app().get_plugin<chain_plugin>().get_abi_serializer_max_time();
          }
 
-         if( options.count( "elastic-queue-size" )) {
-            my->max_queue_size = options.at( "elastic-queue-size" ).as<uint32_t>();
-         }
          if( options.count( "elastic-block-start" )) {
             my->start_block_num = options.at( "elastic-block-start" ).as<uint32_t>();
          }
@@ -870,20 +686,24 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
 
          std::string url_str = options.at( "elastic-url" ).as<std::string>();
          if ( url_str.back() != '/' ) url_str.push_back('/');
-         std::string user_str = "";
-         std::string password_str = "";
+
          size_t thr_pool_size = options.at( "elastic-thread-pool-size" ).as<size_t>();
          size_t bulk_size = options.at( "elastic-bulk-size" ).as<size_t>();
 
-         my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), user_str, password_str) );
+         bool dry_run = options.at( "elastic-dry-run" ).as<bool>();
+         if (dry_run) wlog("running in dry run mode");
+
+         my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), "accounts", dry_run) );
+
+         ilog("bulk request size: ${bs}mb", ("bs", bulk_size));
+         for (int i = 0; i < thr_pool_size; i++) {
+            auto path = "bulk-" + std::to_string(i);
+            my->bulkers.emplace_back( new bulker( bulk_size * 1024 * 1024, std::vector<std::string>({url_str}), path, dry_run) );
+         }
 
          ilog("init thread pool, size: ${tps}", ("tps", thr_pool_size));
          my->thread_pool.reset( new ThreadPool(thr_pool_size) );
-         my->max_task_queue_size = my->max_queue_size * 16;
-
-         ilog("bulk request size: ${bs}mb", ("bs", bulk_size));
-         my->bulk_pool.reset( new bulker_pool(thr_pool_size, bulk_size * 1024 * 1024,
-                              std::vector<std::string>({url_str}), user_str, password_str) );
+         my->max_task_queue_size = thr_pool_size * 4096;
 
          // hook up to signals on controller
          chain_plugin* chain_plug = app().find_plugin<chain_plugin>();
@@ -891,13 +711,17 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          auto& chain = chain_plug->chain();
          my->chain_id.emplace( chain.get_chain_id());
 
+         abi_cache_plugin* abi_cache_plug = app().find_plugin<abi_cache_plugin>();
+         EOS_ASSERT( abi_cache_plug, chain::missing_chain_plugin_exception, "" );
+         my->abi_cache_plug = abi_cache_plug;
+
          my->irreversible_block_connection.emplace(
             chain.irreversible_block.connect( [&]( const chain::block_state_ptr& bs ) {
-               my->applied_irreversible_block( bs );
+               my->process_irreversible_block( bs );
             } ));
          my->applied_transaction_connection.emplace(
             chain.applied_transaction.connect( [&]( const chain::transaction_trace_ptr& t ) {
-               my->applied_transaction( t );
+               my->process_applied_transaction( t );
             } ));
 
          my->init();
