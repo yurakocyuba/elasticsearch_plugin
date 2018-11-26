@@ -68,16 +68,15 @@ public:
    elasticsearch_plugin_impl();
    ~elasticsearch_plugin_impl();
 
-
    fc::optional<boost::signals2::scoped_connection> irreversible_block_connection;
+   fc::optional<boost::signals2::scoped_connection> accepted_transaction_connection;
    fc::optional<boost::signals2::scoped_connection> applied_transaction_connection;
 
    void check_task_queue_size();
 
    void process_applied_transaction(chain::transaction_trace_ptr);
-   void _process_applied_transaction(chain::transaction_trace_ptr);
+   void process_accepted_transaction(chain::transaction_metadata_ptr);
    void process_irreversible_block( chain::block_state_ptr );
-   void _process_irreversible_block( chain::block_state_ptr );
 
    void upsert_account(
          std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> &account_upsert_actions,
@@ -100,6 +99,10 @@ public:
    bool filter_on_star = true;
    std::set<filter_entry> filter_on;
    std::set<filter_entry> filter_out;
+   bool store_block_states = true;
+   bool store_transactions = true;
+   bool store_transaction_traces = true;
+   bool store_action_traces = true;
 
    size_t max_task_queue_size = 0;
    int task_queue_sleep_time = 0;
@@ -127,6 +130,8 @@ public:
    static const std::string block_states_index;
    static const std::string trans_traces_index;
    static const std::string action_traces_index;
+   static const std::string trans_index;
+
 };
 
 const action_name elasticsearch_plugin_impl::newaccount = chain::newaccount::get_name();
@@ -137,9 +142,11 @@ const permission_name elasticsearch_plugin_impl::owner = chain::config::owner_na
 const permission_name elasticsearch_plugin_impl::active = chain::config::active_name;
 
 const std::string elasticsearch_plugin_impl::accounts_index = "accounts";
+const std::string elasticsearch_plugin_impl::action_traces_index = "action_traces";
 const std::string elasticsearch_plugin_impl::block_states_index = "block_states";
 const std::string elasticsearch_plugin_impl::trans_traces_index = "transaction_traces";
-const std::string elasticsearch_plugin_impl::action_traces_index = "action_traces";
+const std::string elasticsearch_plugin_impl::trans_index = "transactions";
+
 
 bool elasticsearch_plugin_impl::filter_include( const account_name& receiver, const action_name& act_name,
                                            const vector<chain::permission_level>& authorization ) const
@@ -214,35 +221,6 @@ elasticsearch_plugin_impl::elasticsearch_plugin_impl()
 elasticsearch_plugin_impl::~elasticsearch_plugin_impl()
 {
    ilog( "elasticsearch_plugin shutdown in process please be patient this can take a few minutes" );
-}
-
-void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
-   try {
-      // always call since we need to capture setabi on accounts even if not storing transaction traces
-      if( !t->producer_block_id.valid() )
-         return;
-      _process_applied_transaction( t );
-   } catch (fc::exception& e) {
-      elog("FC Exception while processing applied transaction trace: ${e}", ("e", e.to_detail_string()));
-   } catch (std::exception& e) {
-      elog("STD Exception while processing applied transaction trace: ${e}", ("e", e.what()));
-   } catch (...) {
-      elog("Unknown exception while processing applied transaction trace");
-   }
-}
-
-void elasticsearch_plugin_impl::process_irreversible_block( chain::block_state_ptr bs) {
-  try {
-     if( start_block_reached ) {
-        _process_irreversible_block( bs );
-     }
-  } catch (fc::exception& e) {
-     elog("FC Exception while processing irreversible block: ${e}", ("e", e.to_detail_string()));
-  } catch (std::exception& e) {
-     elog("STD Exception while processing irreversible block: ${e}", ("e", e.what()));
-  } catch (...) {
-     elog("Unknown exception while processing irreversible block");
-  }
 }
 
 void elasticsearch_plugin_impl::create_new_account(
@@ -402,7 +380,11 @@ void elasticsearch_plugin_impl::upsert_account(
    }
 }
 
-void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction_trace_ptr t ) {
+
+void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
+
+   if( !t->producer_block_id.valid() )
+      return;
 
    transaction_trace_queue.emplace_back(t);
 
@@ -494,6 +476,7 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
                for (auto& atrace : base_action_traces) {
                   fc::mutable_variant_object action_traces_doc;
                   chain::base_action_trace &base = atrace.get();
+                  auto &global_sequence = base.receipt.global_sequence;
                   auto &name = base.act.account;
                   auto &abi_sequence = base.receipt.abi_sequence;
 
@@ -514,30 +497,22 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
 
                   fc::mutable_variant_object act_doc;
                   fc::from_variant( action_traces_doc["act"], act_doc );
-                  act_doc["text_data"] = fc::json::to_string( act_doc["data"] );
+                  act_doc["data"] = fc::json::to_string( act_doc["data"] );
 
                   action_traces_doc["act"] = act_doc;
 
                   fc::mutable_variant_object action_doc;
                   action_doc("_index", action_traces_index);
                   action_doc("_type", "_doc");
-                  action_doc("_id", action_traces_doc["receipt"]["global_sequence"]);
+                  action_doc("_id", global_sequence);
 
                   auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
                   auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
 
                   bulkers[thread_idx]->append_document(std::move(action), std::move(json));
                }
-            }
-         );
 
-         thread_pool->enqueue(
-            [ t, this ](size_t thread_idx)
-            {
                // transaction trace index
-               const auto& trx_id = t->id;
-               const auto trx_id_str = trx_id.str();
-
                fc::mutable_variant_object trans_traces_doc(*t);
 
                fc::mutable_variant_object action_doc;
@@ -557,13 +532,67 @@ void elasticsearch_plugin_impl::_process_applied_transaction( chain::transaction
 
 }
 
-void elasticsearch_plugin_impl::_process_irreversible_block(chain::block_state_ptr bs) {
+void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction_metadata_ptr t ) {
+   check_task_queue_size();
+   thread_pool->enqueue(
+      [ t, this ](size_t thread_idx)
+      {
+         const auto& trx = t->trx;
+         if( !filter_include( trx ) ) return;
+
+         const auto& trx_id = t->id;
+         const auto trx_id_str = trx_id.str();
+
+         fc::mutable_variant_object trans_doc;
+         fc::mutable_variant_object doc;
+
+         fc::variant v;
+         fc::to_variant(trx, v);
+         fc::from_variant( v, trans_doc );
+         trans_doc("trx_id", trx_id_str);
+
+         fc::variant signing_keys;
+         if( t->signing_keys.valid() ) {
+            signing_keys = t->signing_keys->second;
+         } else {
+            signing_keys = trx.get_signature_keys( *chain_id, false, false );
+         }
+
+         if( !signing_keys.is_null() ) {
+            trans_doc("signing_keys", signing_keys);
+         }
+
+         trans_doc("accepted", t->accepted);
+         trans_doc("implicit", t->implicit);
+         trans_doc("scheduled", t->scheduled);
+
+         doc("doc", trans_doc);
+         doc("doc_as_upsert", true);
+
+         fc::mutable_variant_object action_doc;
+         action_doc("_index", trans_index);
+         action_doc("_type", "_doc");
+         action_doc("_id", trx_id_str);
+         action_doc("retry_on_conflict", 100);
+
+         auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
+         auto json = fc::json::to_string( doc );
+
+         bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+      }
+   );
+}
+
+
+
+void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_ptr bs) {
    check_task_queue_size();
    thread_pool->enqueue(
       [ bs, this ](size_t thread_idx)
       {
          const auto block_id = bs->block->id();
          const auto block_id_str = block_id.str();
+         const auto block_num = bs->block->block_num();
 
          fc::mutable_variant_object doc(*bs);
 
@@ -577,6 +606,43 @@ void elasticsearch_plugin_impl::_process_irreversible_block(chain::block_state_p
 
          bulkers[thread_idx]->append_document(std::move(action), std::move(json));
 
+
+         for( const auto& receipt : bs->block->transactions ) {
+            string trx_id_str;
+            if( receipt.trx.contains<packed_transaction>() ) {
+               const auto& pt = receipt.trx.get<packed_transaction>();
+               // get id via get_raw_transaction() as packed_transaction.id() mutates internal transaction state
+               const auto& raw = pt.get_raw_transaction();
+               const auto& trx = fc::raw::unpack<transaction>( raw );
+               if( !filter_include( trx ) ) continue;
+               const auto& id = trx.id();
+               trx_id_str = id.str();
+            } else {
+               const auto& id = receipt.trx.get<transaction_id_type>();
+               trx_id_str = id.str();
+            }
+
+            fc::mutable_variant_object trans_doc;
+            fc::mutable_variant_object doc;
+
+            trans_doc("irreversible", true);
+            trans_doc("block_id", block_id_str);
+            trans_doc("block_num", static_cast<int32_t>(block_num));
+
+            doc("doc", trans_doc);
+            doc("doc_as_upsert", true);
+
+            fc::mutable_variant_object action_doc;
+            action_doc("_index", trans_index);
+            action_doc("_type", "_doc");
+            action_doc("_id", trx_id_str);
+            action_doc("retry_on_conflict", 100);
+
+            auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
+            auto json = fc::json::to_string( doc );
+
+            bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+         }
       }
    );
 }
@@ -715,6 +781,10 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          EOS_ASSERT( abi_cache_plug, chain::missing_chain_plugin_exception, "" );
          my->abi_cache_plug = abi_cache_plug;
 
+         my->accepted_transaction_connection.emplace(
+            chain.accepted_transaction.connect( [&]( const chain::transaction_metadata_ptr& t ) {
+               my->process_accepted_transaction( t );
+            } ));
          my->irreversible_block_connection.emplace(
             chain.irreversible_block.connect( [&]( const chain::block_state_ptr& bs ) {
                my->process_irreversible_block( bs );
