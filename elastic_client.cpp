@@ -22,8 +22,8 @@ bool is_2xx(int32_t status_code)
 }
 } // namespace
 
-elastic_client::elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool to_file)
-   :client(url_list, "", "", std::numeric_limits<int32_t>::max()), filename(filename), to_file(to_file)
+elastic_client::elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool dump)
+   :client(url_list, "", "", std::numeric_limits<int32_t>::max()), filename(filename), dump(dump)
 {
    if ( !boost::filesystem::exists(filename) || boost::filesystem::is_empty(filename) ) {
       ofs.reset( new boost::filesystem::ofstream(filename) );
@@ -119,7 +119,7 @@ void elastic_client::delete_by_query(const std::string &index_name, const std::s
 
 void elastic_client::bulk_perform(const std::string &bulk)
 {
-   if (to_file) {
+   if (dump) {
       ilog("write bulk content ot: ${p}", ("p", filename));
       *ofs << bulk;
       return;
@@ -133,7 +133,7 @@ void elastic_client::bulk_perform(const std::string &bulk)
       EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
    } catch( ... ) {
       ilog("write bulk content ot: ${p}", ("p", filename));
-      to_file = true;
+      dump = true;
       *ofs << bulk;
       throw;
    }

@@ -451,7 +451,7 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                   action_doc("_type", "_doc");
                   action_doc("_id", id);
 
-                  auto es_action = fc::json::to_string( fc::variant_object("index", action_doc) );
+                  auto es_action = fc::json::to_string( fc::variant_object("update", action_doc) );
 
                   bulk += es_action + '\n';
                   bulk += json + '\n';
@@ -533,6 +533,9 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
 }
 
 void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction_metadata_ptr t ) {
+   if( !start_block_reached )
+      return;
+
    check_task_queue_size();
    thread_pool->enqueue(
       [ t, this ](size_t thread_idx)
@@ -583,9 +586,15 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
    );
 }
 
-
-
 void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_ptr bs) {
+   if( !start_block_reached ) {
+      if( bs->block_num >= start_block_num ) {
+         start_block_reached = true;
+      } else {
+         return;
+      }
+   }
+
    check_task_queue_size();
    thread_pool->enqueue(
       [ bs, this ](size_t thread_idx)
@@ -593,6 +602,9 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
          const auto block_id = bs->block->id();
          const auto block_id_str = block_id.str();
          const auto block_num = bs->block->block_num();
+
+         if ( block_num % 10000 == 0 )
+            ilog("block_num: ${n}", ("n", block_num));
 
          fc::mutable_variant_object doc(*bs);
 
@@ -759,12 +771,14 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          bool dry_run = options.at( "elastic-dry-run" ).as<bool>();
          if (dry_run) wlog("running in dry run mode");
 
-         my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), "accounts", dry_run) );
+
+         auto dump_path = app().data_dir() / "accounts-dump";
+         my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), dump_path, dry_run) );
 
          ilog("bulk request size: ${bs}mb", ("bs", bulk_size));
          for (int i = 0; i < thr_pool_size; i++) {
-            auto path = "bulk-" + std::to_string(i);
-            my->bulkers.emplace_back( new bulker( bulk_size * 1024 * 1024, std::vector<std::string>({url_str}), path, dry_run) );
+            auto dump_path = app().data_dir() / ("bulk-dump-" + std::to_string(i));
+            my->bulkers.emplace_back( new bulker( bulk_size * 1024 * 1024, std::vector<std::string>({url_str}), dump_path, dry_run) );
          }
 
          ilog("init thread pool, size: ${tps}", ("tps", thr_pool_size));

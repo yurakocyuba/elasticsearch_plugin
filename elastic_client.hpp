@@ -10,7 +10,7 @@ namespace eosio {
 class elastic_client
 {
 public:
-   elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool to_file);
+   elastic_client(const std::vector<std::string> url_list, const boost::filesystem::path& filename, bool dump);
 
    void delete_index(const std::string &index_name);
    void init_index(const std::string &index_name, const std::string &mappings);
@@ -28,7 +28,7 @@ public:
    elasticlient::Client client;
    boost::filesystem::path filename;
    std::unique_ptr<boost::filesystem::ofstream> ofs;
-   bool to_file = false;
+   bool dump = false;
 };
 
 }
