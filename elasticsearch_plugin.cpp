@@ -100,6 +100,7 @@ public:
    std::set<filter_entry> filter_on;
    std::set<filter_entry> filter_out;
    bool store_block_states = true;
+   bool store_blocks = true;
    bool store_transactions = true;
    bool store_transaction_traces = true;
    bool store_action_traces = true;
@@ -128,6 +129,7 @@ public:
 
    static const std::string accounts_index;
    static const std::string block_states_index;
+   static const std::string blocks_index;
    static const std::string trans_traces_index;
    static const std::string action_traces_index;
    static const std::string trans_index;
@@ -144,6 +146,7 @@ const permission_name elasticsearch_plugin_impl::active = chain::config::active_
 const std::string elasticsearch_plugin_impl::accounts_index = "accounts";
 const std::string elasticsearch_plugin_impl::action_traces_index = "action_traces";
 const std::string elasticsearch_plugin_impl::block_states_index = "block_states";
+const std::string elasticsearch_plugin_impl::blocks_index = "blocks";
 const std::string elasticsearch_plugin_impl::trans_traces_index = "transaction_traces";
 const std::string elasticsearch_plugin_impl::trans_index = "transactions";
 
@@ -473,57 +476,64 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                const auto& trx_id = t->id;
                const auto trx_id_str = trx_id.str();
 
-               for (auto& atrace : base_action_traces) {
-                  fc::mutable_variant_object action_traces_doc;
-                  chain::base_action_trace &base = atrace.get();
-                  auto &global_sequence = base.receipt.global_sequence;
-                  auto &name = base.act.account;
-                  auto &abi_sequence = base.receipt.abi_sequence;
+               if (store_action_traces) {
+                  for (auto& atrace : base_action_traces) {
+                     fc::mutable_variant_object action_traces_doc;
+                     chain::base_action_trace &base = atrace.get();
+                     auto &global_sequence = base.receipt.global_sequence;
+                     auto &name = base.act.account;
+                     auto &abi_sequence = base.receipt.abi_sequence;
 
-                  auto func = [&]( account_name n ) {
-                     EOS_ASSERT( n == name, chain::elasticsearch_exception, "mismatch abi account name" );
-                     return abi_cache_plug->get_abi_serializer( name, abi_sequence );
-                  };
+                     auto func = [&]( account_name n ) {
+                        EOS_ASSERT( n == name, chain::elasticsearch_exception, "mismatch abi account name" );
+                        return abi_cache_plug->get_abi_serializer( name, abi_sequence );
+                     };
 
-                  while ( abi_sequence > abi_cache_plug->global_sequence_height()) {
-                     wlog("action trace global sequence: ${n}", ("n", abi_sequence));
-                     boost::this_thread::sleep_for( boost::chrono::milliseconds( 5 ));
+                     while (true) {
+                        uint64_t height = abi_cache_plug->global_sequence_height();
+                        if (global_sequence <= height)
+                           break;
+                        wlog("action trace global sequence: ${n}, global sequence height: ${h}", ("n", global_sequence)("h", height));
+                        boost::this_thread::sleep_for( boost::chrono::milliseconds( 5 ));
+                     }
+
+                     fc::variant pretty_output;
+                     abi_serializer::to_variant( base, pretty_output, func, abi_serializer_max_time );
+
+                     fc::from_variant( pretty_output, action_traces_doc );
+
+                     fc::mutable_variant_object act_doc;
+                     fc::from_variant( action_traces_doc["act"], act_doc );
+                     act_doc["data"] = fc::json::to_string( act_doc["data"] );
+
+                     action_traces_doc["act"] = act_doc;
+
+                     fc::mutable_variant_object action_doc;
+                     action_doc("_index", action_traces_index);
+                     action_doc("_type", "_doc");
+                     action_doc("_id", global_sequence);
+
+                     auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+                     auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
+
+                     bulkers[thread_idx]->append_document(std::move(action), std::move(json));
                   }
+               }
 
-                  fc::variant pretty_output;
-                  abi_serializer::to_variant( base, pretty_output, func, abi_serializer_max_time );
+               if (store_transaction_traces) {
 
-                  fc::from_variant( pretty_output, action_traces_doc );
-
-                  fc::mutable_variant_object act_doc;
-                  fc::from_variant( action_traces_doc["act"], act_doc );
-                  act_doc["data"] = fc::json::to_string( act_doc["data"] );
-
-                  action_traces_doc["act"] = act_doc;
+                  fc::mutable_variant_object trans_traces_doc(*t);
 
                   fc::mutable_variant_object action_doc;
-                  action_doc("_index", action_traces_index);
+                  action_doc("_index", trans_traces_index);
                   action_doc("_type", "_doc");
-                  action_doc("_id", global_sequence);
+                  action_doc("_id", trx_id_str);
 
                   auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-                  auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
+                  auto json = fc::json::to_string( trans_traces_doc );
 
                   bulkers[thread_idx]->append_document(std::move(action), std::move(json));
                }
-
-               // transaction trace index
-               fc::mutable_variant_object trans_traces_doc(*t);
-
-               fc::mutable_variant_object action_doc;
-               action_doc("_index", trans_traces_index);
-               action_doc("_type", "_doc");
-               action_doc("_id", trx_id_str);
-
-               auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-               auto json = fc::json::to_string( trans_traces_doc );
-
-               bulkers[thread_idx]->append_document(std::move(action), std::move(json));
 
             }
          );
@@ -533,7 +543,7 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
 }
 
 void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction_metadata_ptr t ) {
-   if( !start_block_reached )
+   if( !start_block_reached || !store_transactions )
       return;
 
    check_task_queue_size();
@@ -608,52 +618,69 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
 
          fc::mutable_variant_object doc(*bs);
 
-         fc::mutable_variant_object action_doc;
-         action_doc("_index", block_states_index);
-         action_doc("_type", "_doc");
-         action_doc("_id", block_id_str);
+         if (store_blocks) {
+            fc::mutable_variant_object action_doc;
+            action_doc("_index", blocks_index);
+            action_doc("_type", "_doc");
+            action_doc("_id", block_id_str);
 
-         auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
-         auto json = fc::json::to_string( doc );
+            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
+            auto json = fc::json::to_string( doc["block"] );
 
-         bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+            bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+         }
 
-
-         for( const auto& receipt : bs->block->transactions ) {
-            string trx_id_str;
-            if( receipt.trx.contains<packed_transaction>() ) {
-               const auto& pt = receipt.trx.get<packed_transaction>();
-               // get id via get_raw_transaction() as packed_transaction.id() mutates internal transaction state
-               const auto& raw = pt.get_raw_transaction();
-               const auto& trx = fc::raw::unpack<transaction>( raw );
-               if( !filter_include( trx ) ) continue;
-               const auto& id = trx.id();
-               trx_id_str = id.str();
-            } else {
-               const auto& id = receipt.trx.get<transaction_id_type>();
-               trx_id_str = id.str();
-            }
-
-            fc::mutable_variant_object trans_doc;
-            fc::mutable_variant_object doc;
-
-            trans_doc("irreversible", true);
-            trans_doc("block_id", block_id_str);
-            trans_doc("block_num", static_cast<int32_t>(block_num));
-
-            doc("doc", trans_doc);
-            doc("doc_as_upsert", true);
+         if (store_block_states) {
+            doc.erase("block");
 
             fc::mutable_variant_object action_doc;
-            action_doc("_index", trans_index);
+            action_doc("_index", block_states_index);
             action_doc("_type", "_doc");
-            action_doc("_id", trx_id_str);
-            action_doc("retry_on_conflict", 100);
+            action_doc("_id", block_id_str);
 
-            auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
+            auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
             auto json = fc::json::to_string( doc );
 
             bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+         }
+
+         if (store_transactions) {
+            for( const auto& receipt : bs->block->transactions ) {
+               string trx_id_str;
+               if( receipt.trx.contains<packed_transaction>() ) {
+                  const auto& pt = receipt.trx.get<packed_transaction>();
+                  // get id via get_raw_transaction() as packed_transaction.id() mutates internal transaction state
+                  const auto& raw = pt.get_raw_transaction();
+                  const auto& trx = fc::raw::unpack<transaction>( raw );
+                  if( !filter_include( trx ) ) continue;
+                  const auto& id = trx.id();
+                  trx_id_str = id.str();
+               } else {
+                  const auto& id = receipt.trx.get<transaction_id_type>();
+                  trx_id_str = id.str();
+               }
+
+               fc::mutable_variant_object trans_doc;
+               fc::mutable_variant_object doc;
+
+               trans_doc("irreversible", true);
+               trans_doc("block_id", block_id_str);
+               trans_doc("block_num", static_cast<int32_t>(block_num));
+
+               doc("doc", trans_doc);
+               doc("doc_as_upsert", true);
+
+               fc::mutable_variant_object action_doc;
+               action_doc("_index", trans_index);
+               action_doc("_type", "_doc");
+               action_doc("_id", trx_id_str);
+               action_doc("retry_on_conflict", 100);
+
+               auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
+               auto json = fc::json::to_string( doc );
+
+               bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+            }
          }
       }
    );
@@ -705,6 +732,16 @@ void elasticsearch_plugin::set_program_options(options_description&, options_des
          "If specified then only abi data pushed to elasticsearch until specified block is reached.")
       ("elastic-url,u", bpo::value<std::string>(),
          "elasticsearch URL connection string If not specified then plugin is disabled.")
+      ("elastic-store-blocks", bpo::value<bool>()->default_value(true),
+         "Enables storing blocks in elasticsearch.")
+      ("elastic-store-block-states", bpo::value<bool>()->default_value(true),
+         "Enables storing block state in elasticsearch.")
+      ("elastic-store-transactions", bpo::value<bool>()->default_value(true),
+         "Enables storing transactions in elasticsearch.")
+      ("elastic-store-transaction-traces", bpo::value<bool>()->default_value(true),
+         "Enables storing transaction traces in elasticsearch.")
+      ("elastic-store-action-traces", bpo::value<bool>()->default_value(true),
+         "Enables storing action traces in elasticsearch.")
       ("elastic-filter-on", bpo::value<vector<string>>()->composing(),
          "Track actions which match receiver:action:actor. Receiver, Action, & Actor may be blank to include all. i.e. eosio:: or :transfer:  Use * or leave unspecified to include all.")
       ("elastic-filter-out", bpo::value<vector<string>>()->composing(),
@@ -728,6 +765,22 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
 
          if( options.count( "elastic-block-start" )) {
             my->start_block_num = options.at( "elastic-block-start" ).as<uint32_t>();
+         }
+
+         if( options.count( "elastic-store-blocks" )) {
+            my->store_blocks = options.at( "elastic-store-blocks" ).as<bool>();
+         }
+         if( options.count( "elastic-store-block-states" )) {
+            my->store_block_states = options.at( "elastic-store-block-states" ).as<bool>();
+         }
+         if( options.count( "elastic-store-transactions" )) {
+            my->store_transactions = options.at( "elastic-store-transactions" ).as<bool>();
+         }
+         if( options.count( "elastic-store-transaction-traces" )) {
+            my->store_transaction_traces = options.at( "elastic-store-transaction-traces" ).as<bool>();
+         }
+         if( options.count( "elastic-store-action-traces" )) {
+            my->store_action_traces = options.at( "elastic-store-action-traces" ).as<bool>();
          }
 
          if( options.count( "elastic-filter-on" )) {
