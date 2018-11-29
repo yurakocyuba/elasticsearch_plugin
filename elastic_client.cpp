@@ -120,7 +120,7 @@ void elastic_client::delete_by_query(const std::string &index_name, const std::s
 void elastic_client::bulk_perform(const std::string &bulk)
 {
    if (dump) {
-      ilog("write bulk content ot: ${p}", ("p", filename));
+      ilog("write bulk content to: ${p}", ("p", filename));
       *ofs << bulk;
       return;
    }
@@ -132,7 +132,7 @@ void elastic_client::bulk_perform(const std::string &bulk)
       fc::variant text_doc( fc::json::from_string(resp.text) );
       EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
    } catch( ... ) {
-      ilog("write bulk content ot: ${p}", ("p", filename));
+      ilog("write bulk content to: ${p}", ("p", filename));
       dump = true;
       *ofs << bulk;
       throw;

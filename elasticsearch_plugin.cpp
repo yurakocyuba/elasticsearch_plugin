@@ -95,10 +95,12 @@ public:
 
    uint32_t start_block_num = 0;
    std::atomic_bool start_block_reached{false};
+   std::atomic_bool done{false};
 
    bool filter_on_star = true;
    std::set<filter_entry> filter_on;
    std::set<filter_entry> filter_out;
+   bool store_accounts = true;
    bool store_block_states = true;
    bool store_blocks = true;
    bool store_transactions = true;
@@ -117,7 +119,7 @@ public:
 
    abi_cache_plugin* abi_cache_plug;
    std::unique_ptr<elastic_client> es_client;
-   std::vector<std::unique_ptr<bulker>> bulkers;
+   std::unique_ptr<bulker_pool> bulk_pool;
    std::unique_ptr<ThreadPool> thread_pool;
 
    static const action_name newaccount;
@@ -223,6 +225,7 @@ elasticsearch_plugin_impl::elasticsearch_plugin_impl()
 
 elasticsearch_plugin_impl::~elasticsearch_plugin_impl()
 {
+   done = true;
    ilog( "elasticsearch_plugin shutdown in process please be patient this can take a few minutes" );
 }
 
@@ -386,14 +389,14 @@ void elasticsearch_plugin_impl::upsert_account(
 
 void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_trace_ptr t ) {
 
-   if( !t->producer_block_id.valid() )
+   if( !start_block_reached || !t->producer_block_id.valid() )
       return;
 
    transaction_trace_queue.emplace_back(t);
 
    check_task_queue_size();
    thread_pool->enqueue(
-      [ this ](size_t thread_idx)
+      [ this ]()
       {
          chain::transaction_trace_ptr t;
          std::unordered_map<uint64_t, std::pair<std::string, fc::mutable_variant_object>> account_upsert_actions;
@@ -415,7 +418,7 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                   auto &atrace = stack.top().get();
                   stack.pop();
 
-                  if( executed && atrace.receipt.receiver == chain::config::system_account_name ) {
+                  if( executed && store_accounts && atrace.receipt.receiver == chain::config::system_account_name ) {
                      upsert_account( account_upsert_actions, atrace.act, atrace.block_time );
                   }
 
@@ -469,9 +472,9 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
          }
 
          if( base_action_traces.empty() ) return; //< do not index transaction_trace if all action_traces filtered out
-
+         check_task_queue_size();
          thread_pool->enqueue(
-            [ t, base_action_traces{std::move(base_action_traces)}, this ](size_t thread_idx)
+            [ t, base_action_traces{std::move(base_action_traces)}, this ]()
             {
                const auto& trx_id = t->id;
                const auto trx_id_str = trx_id.str();
@@ -489,11 +492,15 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                         return abi_cache_plug->get_abi_serializer( name, abi_sequence );
                      };
 
-                     while (true) {
+                     // make sure global height not exceed abi_cahce_plugin processed height
+                     uint64_t elapse = 0, height;
+                     while (!done) {
                         uint64_t height = abi_cache_plug->global_sequence_height();
                         if (global_sequence <= height)
                            break;
-                        wlog("action trace global sequence: ${n}, global sequence height: ${h}", ("n", global_sequence)("h", height));
+                        if ( elapse > 0 && elapse % 5000 == 0 )
+                           wlog("elapse: ${t} ms, global sequence: ${n}, global sequence height: ${h}", ("t", elapse)("n", global_sequence)("h", height));
+                        elapse += 5;
                         boost::this_thread::sleep_for( boost::chrono::milliseconds( 5 ));
                      }
 
@@ -516,7 +523,8 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                      auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
                      auto json = fc::prune_invalid_utf8( fc::json::to_string(action_traces_doc) );
 
-                     bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+                     bulker& bulk = bulk_pool->get();
+                     bulk.append_document(std::move(action), std::move(json));
                   }
                }
 
@@ -532,7 +540,8 @@ void elasticsearch_plugin_impl::process_applied_transaction( chain::transaction_
                   auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
                   auto json = fc::json::to_string( trans_traces_doc );
 
-                  bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+                  bulker& bulk = bulk_pool->get();
+                  bulk.append_document(std::move(action), std::move(json));
                }
 
             }
@@ -548,7 +557,7 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
 
    check_task_queue_size();
    thread_pool->enqueue(
-      [ t, this ](size_t thread_idx)
+      [ t, this ]()
       {
          const auto& trx = t->trx;
          if( !filter_include( trx ) ) return;
@@ -591,7 +600,8 @@ void elasticsearch_plugin_impl::process_accepted_transaction( chain::transaction
          auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
          auto json = fc::json::to_string( doc );
 
-         bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+         bulker& bulk = bulk_pool->get();
+         bulk.append_document(std::move(action), std::move(json));
       }
    );
 }
@@ -607,7 +617,7 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
 
    check_task_queue_size();
    thread_pool->enqueue(
-      [ bs, this ](size_t thread_idx)
+      [ bs, this ]()
       {
          const auto block_id = bs->block->id();
          const auto block_id_str = block_id.str();
@@ -627,7 +637,8 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
             auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
             auto json = fc::json::to_string( doc["block"] );
 
-            bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+            bulker& bulk = bulk_pool->get();
+            bulk.append_document(std::move(action), std::move(json));
          }
 
          if (store_block_states) {
@@ -641,7 +652,8 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
             auto action = fc::json::to_string( fc::variant_object("index", action_doc) );
             auto json = fc::json::to_string( doc );
 
-            bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+            bulker& bulk = bulk_pool->get();
+            bulk.append_document(std::move(action), std::move(json));
          }
 
          if (store_transactions) {
@@ -679,7 +691,8 @@ void elasticsearch_plugin_impl::process_irreversible_block(chain::block_state_pt
                auto action = fc::json::to_string( fc::variant_object("update", action_doc) );
                auto json = fc::json::to_string( doc );
 
-               bulkers[thread_idx]->append_document(std::move(action), std::move(json));
+               bulker& bulk = bulk_pool->get();
+               bulk.append_document(std::move(action), std::move(json));
             }
          }
       }
@@ -726,12 +739,16 @@ void elasticsearch_plugin::set_program_options(options_description&, options_des
    cfg.add_options()
       ("elastic-thread-pool-size", bpo::value<size_t>()->default_value(4),
          "The size of the data processing thread pool.")
+      ("elastic-max-queue-size", bpo::value<size_t>()->default_value(65536),
+       "The max size of the thread pool task queue.")
       ("elastic-bulk-size", bpo::value<size_t>()->default_value(5),
          "The size(megabytes) of the each bulk request.")
       ("elastic-block-start", bpo::value<uint32_t>()->default_value(0),
-         "If specified then only abi data pushed to elasticsearch until specified block is reached.")
+         "If specified no data pushed to elasticsearch until specified block is reached.")
       ("elastic-url,u", bpo::value<std::string>(),
          "elasticsearch URL connection string If not specified then plugin is disabled.")
+      ("elastic-store-accounts", bpo::value<bool>()->default_value(true),
+         "Enables storing accounts in elasticsearch.")
       ("elastic-store-blocks", bpo::value<bool>()->default_value(true),
          "Enables storing blocks in elasticsearch.")
       ("elastic-store-block-states", bpo::value<bool>()->default_value(true),
@@ -766,7 +783,9 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          if( options.count( "elastic-block-start" )) {
             my->start_block_num = options.at( "elastic-block-start" ).as<uint32_t>();
          }
-
+         if( options.count( "elastic-store-accounts" )) {
+            my->store_accounts = options.at( "elastic-store-accounts" ).as<bool>();
+         }
          if( options.count( "elastic-store-blocks" )) {
             my->store_blocks = options.at( "elastic-store-blocks" ).as<bool>();
          }
@@ -819,6 +838,7 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          if ( url_str.back() != '/' ) url_str.push_back('/');
 
          size_t thr_pool_size = options.at( "elastic-thread-pool-size" ).as<size_t>();
+         my->max_task_queue_size = options.at( "elastic-max-queue-size" ).as<size_t>();
          size_t bulk_size = options.at( "elastic-bulk-size" ).as<size_t>();
 
          bool dry_run = options.at( "elastic-dry-run" ).as<bool>();
@@ -829,14 +849,13 @@ void elasticsearch_plugin::plugin_initialize(const variables_map& options) {
          my->es_client.reset( new elastic_client(std::vector<std::string>({url_str}), dump_path, dry_run) );
 
          ilog("bulk request size: ${bs}mb", ("bs", bulk_size));
-         for (int i = 0; i < thr_pool_size; i++) {
-            auto dump_path = app().data_dir() / ("bulk-dump-" + std::to_string(i));
-            my->bulkers.emplace_back( new bulker( bulk_size * 1024 * 1024, std::vector<std::string>({url_str}), dump_path, dry_run) );
-         }
+         my->bulk_pool.reset(
+            new bulker_pool(
+               thr_pool_size, bulk_size * 1024 * 1024,
+               std::vector<std::string>({url_str}), app().data_dir(), dry_run) );
 
          ilog("init thread pool, size: ${tps}", ("tps", thr_pool_size));
          my->thread_pool.reset( new ThreadPool(thr_pool_size) );
-         my->max_task_queue_size = thr_pool_size * 4096;
 
          // hook up to signals on controller
          chain_plugin* chain_plug = app().find_plugin<chain_plugin>();
@@ -875,6 +894,7 @@ void elasticsearch_plugin::plugin_startup() {
 }
 
 void elasticsearch_plugin::plugin_shutdown() {
+   my->accepted_transaction_connection.reset();
    my->irreversible_block_connection.reset();
    my->applied_transaction_connection.reset();
 
