@@ -105,10 +105,17 @@ void elastic_client::bulk_perform(elasticlient::SameIndexBulkData &bulk)
    auto body = bulk.body();
    auto url = boost::str(boost::format("%1%/_bulk") % index_name);
    cpr::Response resp = client.performRequest(elasticlient::Client::HTTPMethod::POST, url, body);
-   EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
-   
+   try {
+      EOS_ASSERT(is_2xx(resp.status_code), chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text));
+   } catch(int e) {
+      FC_LOG_MESSAGE( chain::response_code_exception, "${code} ${text}", ("code", resp.status_code)("text", resp.text) );
+   }
    fc::variant text_doc( fc::json::from_string(resp.text) );
-   EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
+   try {
+      EOS_ASSERT(text_doc["errors"].as_bool() == false, chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text));
+   } catch(int e) {
+      FC_LOG_MESSAGE( chain::bulk_fail_exception, "bulk perform errors: ${text}", ("text", resp.text) );
+   }
 }
 
 void elastic_client::bulk_perform(const std::string &bulk)
