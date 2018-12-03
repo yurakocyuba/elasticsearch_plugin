@@ -139,7 +139,10 @@ static const std::string action_traces_mapping = R"(
                     "enabled": false
                 },
                 "act": {
-                    "enabled": false
+                    "properties": {
+                        "name": {"type": "keyword"},
+                        "account": {"type": "keyword"}
+                        }
                 },
                 "account_ram_deltas": {
                     "enabled": false
